@@ -1342,3 +1342,129 @@ func TestIssue33(t *testing.T) {
 	}
 	l.Close()
 }
+
+func TestIssue34(t *testing.T) {
+	os.RemoveAll("testlog")
+	defer os.RemoveAll("testlog")
+
+	log, err := Open("testlog", &Options{
+		NoSync:           true,
+		SegmentSize:      4096,
+		SegmentCacheSize: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	data := make([]byte, 1024)
+	for i := 1; i <= 200; i++ {
+		if err := log.Write(uint64(i), data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	workers := 8
+	readsPerWorker := 500
+	errCh := make(chan error, workers)
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < readsPerWorker; i++ {
+				idx := uint64((i*7+workerID)%200 + 1)
+				val, err := log.Read(idx)
+				if err != nil {
+					errCh <- fmt.Errorf("read failed at index %d: %w", idx, err)
+					return
+				}
+				if len(val) != len(data) {
+					errCh <- fmt.Errorf("unexpected data length %d at index %d", len(val), idx)
+					return
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestIssue34ConcurrentReadWrite(t *testing.T) {
+	os.RemoveAll("testlog")
+	defer os.RemoveAll("testlog")
+
+	log, err := Open("testlog", &Options{
+		NoSync:           true,
+		SegmentSize:      4096,
+		SegmentCacheSize: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	data := make([]byte, 1024)
+	for i := 1; i <= 50; i++ {
+		if err := log.Write(uint64(i), data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	var stop int32
+	errCh := make(chan error, 16)
+
+	// Writer goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 51; i <= 200; i++ {
+			if err := log.Write(uint64(i), data); err != nil {
+				errCh <- fmt.Errorf("write failed at index %d: %w", i, err)
+				return
+			}
+		}
+		atomic.StoreInt32(&stop, 1)
+	}()
+
+	// Concurrent readers
+	workers := 4
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for atomic.LoadInt32(&stop) == 0 {
+				last, err := log.LastIndex()
+				if err != nil || last == 0 {
+					continue
+				}
+				idx := uint64((workerID*13)%int(last) + 1)
+				val, err := log.Read(idx)
+				if err != nil {
+					if errors.Is(err, ErrNotFound) {
+						continue
+					}
+					errCh <- fmt.Errorf("read failed at index %d: %w", idx, err)
+					return
+				}
+				if len(val) != len(data) {
+					errCh <- fmt.Errorf("unexpected data length %d at index %d", len(val), idx)
+					return
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+

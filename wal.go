@@ -128,6 +128,7 @@ type Log struct {
 
 // segment represents a single segment file.
 type segment struct {
+	mu    sync.RWMutex
 	path  string // path of segment file
 	index uint64 // first index of segment
 	ebuf  []byte // cached entries buffer
@@ -185,8 +186,10 @@ func (l *Log) pushCache(segIdx int) {
 		l.scache.SetEvicted(segIdx, l.segments[segIdx])
 	if evicted {
 		s := v.(*segment)
+		s.mu.Lock()
 		s.ebuf = nil
 		s.epos = nil
+		s.mu.Unlock()
 	}
 }
 
@@ -577,8 +580,10 @@ func (l *Log) loadSegmentEntries(s *segment) error {
 		epos = append(epos, bpos{pos, pos + n})
 		pos += n
 	}
+	s.mu.Lock()
 	s.ebuf = ebuf
 	s.epos = epos
+	s.mu.Unlock()
 	return nil
 }
 
@@ -620,9 +625,11 @@ func (l *Log) loadSegment(index uint64) (*segment, error) {
 	var rseg *segment
 	l.scache.Range(func(_, v interface{}) bool {
 		s := v.(*segment)
+		s.mu.RLock()
 		if index >= s.index && index < s.index+uint64(len(s.epos)) {
 			rseg = s
 		}
+		s.mu.RUnlock()
 		return false
 	})
 	if rseg != nil {
@@ -631,7 +638,10 @@ func (l *Log) loadSegment(index uint64) (*segment, error) {
 	// find in the segment array
 	idx := l.findSegment(index)
 	s := l.segments[idx]
-	if len(s.epos) == 0 {
+	s.mu.RLock()
+	empty := len(s.epos) == 0
+	s.mu.RUnlock()
+	if empty {
 		// load the entries from cache
 		if err := l.loadSegmentEntries(s); err != nil {
 			return nil, err
@@ -658,17 +668,37 @@ func (l *Log) Read(index uint64) (data []byte, err error) {
 	if err != nil {
 		return nil, err
 	}
+	s.mu.RLock()
+	if index < s.index || index-s.index >= uint64(len(s.epos)) {
+		s.mu.RUnlock()
+		if err := l.loadSegmentEntries(s); err != nil {
+			return nil, err
+		}
+		s.mu.RLock()
+	}
+	if index < s.index || index-s.index >= uint64(len(s.epos)) {
+		s.mu.RUnlock()
+		return nil, ErrNotFound
+	}
 	epos := s.epos[index-s.index]
+	if epos.pos > len(s.ebuf) || epos.end > len(s.ebuf) || epos.pos > epos.end {
+		s.mu.RUnlock()
+		return nil, ErrCorrupt
+	}
 	edata := s.ebuf[epos.pos:epos.end]
 	if l.opts.LogFormat == JSON {
-		return readJSON(edata)
+		data, err = readJSON(edata)
+		s.mu.RUnlock()
+		return data, err
 	}
 	// binary read
 	size, n := binary.Uvarint(edata)
 	if n <= 0 {
+		s.mu.RUnlock()
 		return nil, ErrCorrupt
 	}
 	if uint64(len(edata)-n) < size {
+		s.mu.RUnlock()
 		return nil, ErrCorrupt
 	}
 	if l.opts.NoCopy {
@@ -677,6 +707,7 @@ func (l *Log) Read(index uint64) (data []byte, err error) {
 		data = make([]byte, size)
 		copy(data, edata[n:])
 	}
+	s.mu.RUnlock()
 	return data, nil
 }
 
@@ -717,8 +748,10 @@ func (l *Log) ClearCache() error {
 func (l *Log) clearCache() {
 	l.scache.Range(func(_, v interface{}) bool {
 		s := v.(*segment)
+		s.mu.Lock()
 		s.ebuf = nil
 		s.epos = nil
+		s.mu.Unlock()
 		return true
 	})
 	l.scache = tinylru.LRU{}
@@ -795,8 +828,21 @@ func (l *Log) truncateFront(index uint64) (err error) {
 		if err != nil {
 			return err
 		}
+		s.mu.RLock()
+		if index < s.index || index-s.index >= uint64(len(s.epos)) {
+			s.mu.RUnlock()
+			if err := l.loadSegmentEntries(s); err != nil {
+				return err
+			}
+			s.mu.RLock()
+		}
+		if index < s.index || index-s.index >= uint64(len(s.epos)) {
+			s.mu.RUnlock()
+			return ErrNotFound
+		}
 		epos := s.epos[index-s.index:]
 		ebuf = s.ebuf[epos[0].pos:]
+		s.mu.RUnlock()
 	}
 	// Create a START file contains the truncated segment.
 	startName := filepath.Join(l.path, segmentName(index)+".START")
@@ -903,8 +949,21 @@ func (l *Log) truncateBack(index uint64) (err error) {
 		if err != nil {
 			return err
 		}
+		s.mu.RLock()
+		if index < s.index || index-s.index >= uint64(len(s.epos)) {
+			s.mu.RUnlock()
+			if err := l.loadSegmentEntries(s); err != nil {
+				return err
+			}
+			s.mu.RLock()
+		}
+		if index < s.index || index-s.index >= uint64(len(s.epos)) {
+			s.mu.RUnlock()
+			return ErrNotFound
+		}
 		epos := s.epos[:index-s.index+1]
 		ebuf = s.ebuf[:epos[len(epos)-1].end]
+		s.mu.RUnlock()
 	}
 	// Create an END file contains the truncated segment.
 	endName := filepath.Join(l.path, segmentName(s.index)+".END")
