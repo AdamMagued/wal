@@ -725,8 +725,8 @@ func (l *Log) clearCache() {
 	l.scache.Resize(l.opts.SegmentCacheSize)
 }
 
-// atomicWrite performs an temp write + rename to ensure the file writing is
-// and atomic operation. One os.WriteFile alone is not good enough.
+// atomicWrite performs a temp write + rename to ensure the file writing is
+// an atomic operation. One os.WriteFile alone is not good enough.
 func (l *Log) atomicWrite(name string, data []byte) error {
 	// Create a TEMP file
 	tempName := name + ".TEMP"
@@ -735,21 +735,27 @@ func (l *Log) atomicWrite(name string, data []byte) error {
 		f, err := os.OpenFile(tempName, os.O_CREATE|os.O_RDWR|os.O_TRUNC,
 			l.opts.FilePerms)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to create temp file: %w", err)
 		}
 		defer f.Close()
 		if _, err := f.Write(data); err != nil {
-			return err
+			return fmt.Errorf("failed to write temp file: %w", err)
 		}
 		if err := f.Sync(); err != nil {
-			return err
+			return fmt.Errorf("failed to sync temp file: %w", err)
 		}
-		return f.Close()
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("failed to close temp file: %w", err)
+		}
+		return nil
 	}(); err != nil {
 		return err
 	}
 	// Rename the TEMP file to final name
-	return os.Rename(tempName, name)
+	if err := os.Rename(tempName, name); err != nil {
+		return fmt.Errorf("failed to rename temp file: %w", err)
+	}
+	return nil
 }
 
 // TruncateFront truncates the front of the log by removing all entries that
@@ -831,7 +837,7 @@ func (l *Log) truncateFront(index uint64) (err error) {
 	// Rename the START file to the final truncated segment name.
 	newName := filepath.Join(l.path, segmentName(index))
 	if err = os.Rename(startName, newName); err != nil {
-		return err
+		return fmt.Errorf("failed to rename start segment: %w", err)
 	}
 	s.path = newName
 	s.index = index
@@ -938,7 +944,7 @@ func (l *Log) truncateBack(index uint64) (err error) {
 	// Rename the END file to the final truncated segment name.
 	newName := filepath.Join(l.path, segmentName(s.index))
 	if err = os.Rename(endName, newName); err != nil {
-		return err
+		return fmt.Errorf("failed to rename end segment: %w", err)
 	}
 	// Reopen the tail segment file
 	l.sfile, err = os.OpenFile(newName, os.O_WRONLY, l.opts.FilePerms)

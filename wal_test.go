@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1341,4 +1342,252 @@ func TestIssue33(t *testing.T) {
 		t.Fatal(err)
 	}
 	l.Close()
+}
+
+func TestIssue26_TruncateFrontTempFileCreationError(t *testing.T) {
+	os.RemoveAll("testlog")
+	defer os.RemoveAll("testlog")
+	l, err := Open("testlog", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	for i := uint64(1); i <= 10; i++ {
+		if err := l.Write(i, []byte(fmt.Sprintf("entry-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	startTemp := filepath.Join(l.path, segmentName(5)+".START.TEMP")
+	if err := os.Mkdir(startTemp, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	err = l.TruncateFront(5)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to create start segment") ||
+		!strings.Contains(err.Error(), "failed to create temp file") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	if l.corrupt {
+		t.Fatal("log should not be marked corrupt after temp file creation failure")
+	}
+	for i := uint64(1); i <= 10; i++ {
+		data, err := l.Read(i)
+		if err != nil {
+			t.Fatalf("failed to read entry %d: %v", i, err)
+		}
+		expected := fmt.Sprintf("entry-%d", i)
+		if string(data) != expected {
+			t.Fatalf("expected %q, got %q", expected, string(data))
+		}
+	}
+
+	if err := l.TruncateFront(5); err != nil {
+		t.Fatalf("expected successful truncate after obstruction cleared, got: %v", err)
+	}
+	firstIdx, err := l.FirstIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstIdx != 5 {
+		t.Fatalf("expected first index 5, got %d", firstIdx)
+	}
+	if _, err := l.Read(4); err != ErrNotFound {
+		t.Fatalf("expected ErrNotFound for index 4, got %v", err)
+	}
+}
+
+func TestIssue26_TruncateBackTempFileCreationError(t *testing.T) {
+	os.RemoveAll("testlog")
+	defer os.RemoveAll("testlog")
+	l, err := Open("testlog", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	for i := uint64(1); i <= 10; i++ {
+		if err := l.Write(i, []byte(fmt.Sprintf("entry-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	endTemp := filepath.Join(l.path, segmentName(1)+".END.TEMP")
+	if err := os.Mkdir(endTemp, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	err = l.TruncateBack(5)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to create end segment") ||
+		!strings.Contains(err.Error(), "failed to create temp file") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	if l.corrupt {
+		t.Fatal("log should not be marked corrupt after temp file creation failure")
+	}
+	for i := uint64(1); i <= 10; i++ {
+		data, err := l.Read(i)
+		if err != nil {
+			t.Fatalf("failed to read entry %d: %v", i, err)
+		}
+		expected := fmt.Sprintf("entry-%d", i)
+		if string(data) != expected {
+			t.Fatalf("expected %q, got %q", expected, string(data))
+		}
+	}
+
+	if err := l.TruncateBack(5); err != nil {
+		t.Fatalf("expected successful truncate after obstruction cleared, got: %v", err)
+	}
+	lastIdx, err := l.LastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lastIdx != 5 {
+		t.Fatalf("expected last index 5, got %d", lastIdx)
+	}
+	if _, err := l.Read(6); err != ErrNotFound {
+		t.Fatalf("expected ErrNotFound for index 6, got %v", err)
+	}
+}
+
+func TestIssue26_TruncateFront_AllowEmpty_TempFileCreationError(t *testing.T) {
+	os.RemoveAll("testlog")
+	defer os.RemoveAll("testlog")
+	l, err := Open("testlog", &Options{AllowEmpty: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	for i := uint64(1); i <= 5; i++ {
+		if err := l.Write(i, []byte(fmt.Sprintf("entry-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	startTemp := filepath.Join(l.path, segmentName(6)+".START.TEMP")
+	if err := os.Mkdir(startTemp, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	err = l.TruncateFront(6)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to create start segment") ||
+		!strings.Contains(err.Error(), "failed to create temp file") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	if l.corrupt {
+		t.Fatal("log should not be marked corrupt")
+	}
+	empty, err := l.IsEmpty()
+	if err != nil || empty {
+		t.Fatalf("expected not empty, got %v (err: %v)", empty, err)
+	}
+
+	if err := l.TruncateFront(6); err != nil {
+		t.Fatalf("expected successful truncate, got: %v", err)
+	}
+	empty, err = l.IsEmpty()
+	if err != nil || !empty {
+		t.Fatalf("expected empty log, got %v (err: %v)", empty, err)
+	}
+}
+
+func TestIssue26_TruncateBack_AllowEmpty_TempFileCreationError(t *testing.T) {
+	os.RemoveAll("testlog")
+	defer os.RemoveAll("testlog")
+	l, err := Open("testlog", &Options{AllowEmpty: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	for i := uint64(1); i <= 5; i++ {
+		if err := l.Write(i, []byte(fmt.Sprintf("entry-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	endTemp := filepath.Join(l.path, segmentName(1)+".END.TEMP")
+	if err := os.Mkdir(endTemp, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	err = l.TruncateBack(0)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to create end segment") ||
+		!strings.Contains(err.Error(), "failed to create temp file") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	if l.corrupt {
+		t.Fatal("log should not be marked corrupt")
+	}
+	empty, err := l.IsEmpty()
+	if err != nil || empty {
+		t.Fatalf("expected not empty, got %v (err: %v)", empty, err)
+	}
+
+	if err := l.TruncateBack(0); err != nil {
+		t.Fatalf("expected successful truncate, got: %v", err)
+	}
+	empty, err = l.IsEmpty()
+	if err != nil || !empty {
+		t.Fatalf("expected empty log, got %v (err: %v)", empty, err)
+	}
+}
+
+func TestIssue26_AtomicWrite_Errors(t *testing.T) {
+	os.RemoveAll("testlog")
+	defer os.RemoveAll("testlog")
+	l, err := Open("testlog", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	// 1. File creation error (TEMP path is an existing directory)
+	tempPath := filepath.Join(l.path, "testfile.TEMP")
+	if err := os.Mkdir(tempPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	err = l.atomicWrite(filepath.Join(l.path, "testfile"), []byte("data"))
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to create temp file") {
+		t.Fatalf("expected 'failed to create temp file', got %v", err)
+	}
+
+	// 2. Rename error: target destination is an existing non-empty directory
+	destDir := filepath.Join(l.path, "dest_dir")
+	if err := os.Mkdir(destDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	childFile := filepath.Join(destDir, "child")
+	if err := ioutil.WriteFile(childFile, []byte("child"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err = l.atomicWrite(destDir, []byte("data"))
+	if err == nil {
+		t.Fatal("expected rename error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to rename temp file") {
+		t.Fatalf("expected 'failed to rename temp file', got %v", err)
+	}
 }
